@@ -1,0 +1,305 @@
+# pragma version 0.4.3
+# pragma nonreentrancy on
+# pragma optimize codesize
+"""
+@title LlamaLend V2 Lend Market Controller
+@author Curve.Finance
+@license Copyright (c) Curve.Finance, 2020-2026 - all rights reserved
+@notice Main contract to interact with a LlamaLend Lend Market. Each contract is specific to a single lending market.
+@custom:security security@curve.finance
+@custom:kill Set borrow_cap to 0 and vault's max_supply to 0 to prevent new deposits. Existing loans can still be repaid/liquidated.
+"""
+
+from curve_std.interfaces import IERC20
+from curve_stablecoin.interfaces import IAMM
+from curve_stablecoin.interfaces import IMonetaryPolicy
+from curve_stablecoin.interfaces import IVault
+from curve_stablecoin.interfaces import IController
+from curve_std import crv_math
+
+implements: IController
+
+from curve_stablecoin.interfaces import ILendController
+
+implements: ILendController
+
+from curve_stablecoin import controller as core
+
+from curve_stablecoin.interfaces import IControllerView as IView
+
+implements: IView
+
+implements: core.VirtualMethods
+
+from curve_std import token as tkn
+
+exports: (
+    # Constants
+    core.MAX_RATE,
+    # Loan management
+    core.create_loan,
+    core.borrow_more,
+    core.add_collateral,
+    core.approve,
+    core.remove_collateral,
+    core.repay,
+    core.set_extra_health,
+    core.liquidate,
+    core.save_rate,
+    core.collect_fees,
+    # Related contracts getters
+    core.amm,
+    core.view,
+    core.factory,
+    core.configurator,
+    # Getters
+    core.approval,
+    core.borrowed_token,
+    core.calculate_debt_n1,
+    core.collateral_token,
+    core.debt,
+    core.extra_health,
+    core.health,
+    core.create_loan_health_preview,
+    core.add_collateral_health_preview,
+    core.remove_collateral_health_preview,
+    core.borrow_more_health_preview,
+    core.repay_health_preview,
+    core.liquidate_health_preview,
+    core.liquidation_discount,
+    core.liquidation_discounts,
+    core.loan_discount,
+    core.loan_exists,
+    core.loan_ix,
+    core.loans,
+    core.monetary_policy,
+    core.n_loans,
+    core.tokens_to_liquidate,
+    core.tokens_to_shrink,
+    core.total_debt,
+    core.admin_fees,
+    core.admin_percentage,
+    # Setters
+    core.configure,
+    # From view contract
+    core.user_prices,
+    core.user_state,
+    core.users_to_liquidate,
+    core.min_collateral,
+    core.max_borrowable,
+)
+
+interface ILendView:
+    def max_borrowable_now(
+        _d_collateral: uint256, _N: uint256, _user: address, _recent_debt_packed: uint256
+    ) -> uint256: view
+
+borrow_cap: public(uint256)
+VAULT: immutable(IVault)
+MAX_RECENT_DEBT: constant(uint256) = 15 * 10**16  # 15% of borrow_cap
+RECENT_DEBT_DECAY: constant(uint256) = 5 * 10**16  # 5% of borrow_cap per day
+
+_available_balance: uint256
+# timestamp | (core.repaid + recent debt) << 40
+_recent_debt_packed: uint256
+# Amount of the last on_borrowed_token_transfer_out
+stashed_amount: transient(uint256)
+
+# Last, so that the variables above take small slots, in front of core.loans
+initializes: core
+
+
+@external
+@view
+@reentrant
+def available_balance() -> uint256:
+    return self._available_balance
+
+
+# https://github.com/vyperlang/vyper/issues/4721
+@external
+@view
+@reentrant
+def vault() -> address:
+    """
+    @notice Address of the vault
+    @return Address of the vault contract
+    """
+    return VAULT.address
+
+
+@deploy
+def __init__(
+    _vault: IVault,
+    _amm: IAMM,
+    _borrowed_token: IERC20,
+    _collateral_token: IERC20,
+    _monetary_policy: IMonetaryPolicy,
+    _loan_discount: uint256,
+    _liquidation_discount: uint256,
+    _view_blueprint: address,
+    _configurator: core.IConfigurator,
+):
+    """
+    @notice Lend Controller constructor
+    @param _vault Address of the vault this controller belongs to
+    @param _amm AMM address (already deployed from blueprint)
+    @param _borrowed_token Token which is being borrowed
+    @param _collateral_token Token to use for collateral
+    @param _monetary_policy Address of monetary policy
+    @param _loan_discount Discount of the maximum loan size compare to get_x_down() value
+    @param _liquidation_discount Discount of the maximum loan size compare to
+           get_x_down() for "bad liquidation" purposes
+    @param _view_blueprint Address of the controller view blueprint
+    @param _configurator Address of the configurator contract
+    """
+    VAULT = _vault
+
+    core.__init__(
+        _collateral_token,
+        _borrowed_token,
+        _monetary_policy,
+        _loan_discount,
+        _liquidation_discount,
+        _amm,
+        _view_blueprint,
+        _configurator,
+    )
+
+    # Borrow cap is zero by default in lend markets. The admin has to raise it
+    # after deployment to allow borrowing.
+    core.admin_percentage = 0
+
+    # Pre-approve the vault to transfer borrowed tokens out of the controller
+    tkn.max_approve(core.BORROWED_TOKEN, VAULT.address)
+
+
+@external
+@view
+@reentrant
+def version() -> String[10]:
+    """
+    @notice Version of this controller
+    @return Version string of the form "<core_version>-lend"
+    """
+    return concat(core.version, "-lend")
+
+
+@external
+def configure_lend(_borrow_cap: uint256, _admin_percentage: uint256):
+    assert msg.sender == core.CONFIGURATOR.address, "Only configurator"
+    if _borrow_cap != core.SKIP_CONFIG_UINT256:
+        self.borrow_cap = _borrow_cap
+    if _admin_percentage != core.SKIP_CONFIG_UINT256:
+        rate_mul: uint256 = staticcall core.AMM.get_rate_mul()
+        core._update_total_debt(0, rate_mul, False)
+        core.admin_percentage = _admin_percentage
+
+
+@external
+@reentrant
+def on_borrowed_token_transfer_in(_amount: uint256):
+    """
+    @notice Hook called by
+            1. The controller on repay/liquidate
+            2. The vault on deposit/mint
+    @param _amount Amount of borrowed tokens transferred in
+    """
+    assert msg.sender == VAULT.address or msg.sender == self # dev: vault or controller only
+    self._available_balance += _amount
+
+
+@external
+@reentrant
+def on_borrowed_token_transfer_out(_amount: uint256):
+    """
+    @notice Hook called by
+            1. The controller on create_loan/borrow_more/collect_fees
+            2. The vault on withdraw/redeem
+    @param _amount Amount of borrowed tokens transferred out
+    """
+    assert msg.sender == VAULT.address or msg.sender == self # dev: vault or controller only
+    available_balance: uint256 = self._available_balance
+    # core._admin_fees() == 0 in case of collect_fees()
+    assert _amount <= crv_math.sub_or_zero(available_balance, core._admin_fees()), "Available balance exceeded"
+    self._available_balance = unsafe_sub(available_balance, _amount)
+    self.stashed_amount = _amount
+
+
+@external
+@reentrant
+def _on_debt_increased(_total_debt: uint256):
+    """
+    @notice Hook called when debt is increased
+    @dev Recent debt is freed up by time and by repayments
+    @param _total_debt New total debt after the increase
+    """
+    assert msg.sender == self # dev: virtual method protection (controller only)
+    assert _total_debt <= self.borrow_cap, "Borrow cap exceeded"
+
+    packed: uint256 = self._recent_debt_packed
+    repaid: uint256 = core.repaid
+    # RECENT_DEBT_DECAY / WAD == 1 / 20 and MAX_RECENT_DEBT / RECENT_DEBT_DECAY == 3 exactly
+    freed_per_day: uint256 = unsafe_div(self.borrow_cap, core.WAD // RECENT_DEBT_DECAY)
+    # No overflow unless borrow_cap > 2**220, and then no debt gets near the limit
+    freed: uint256 = unsafe_div(
+        unsafe_mul(freed_per_day, unsafe_sub(block.timestamp, packed & (2**40 - 1))), 86400
+    )
+    recent_debt: uint256 = unsafe_add(
+        crv_math.sub_or_zero(packed >> 40, unsafe_add(repaid, freed)), self.stashed_amount
+    )
+    assert (
+        recent_debt <= unsafe_mul(freed_per_day, MAX_RECENT_DEBT // RECENT_DEBT_DECAY)
+    ), "Borrow limit exceeded"
+    # repaid + recent_debt is truncated to 216 bits, which only lowers recent debt
+    self._recent_debt_packed = block.timestamp | (unsafe_add(repaid, recent_debt) << 40)
+
+
+@external
+@view
+def max_borrowable_now(
+    _d_collateral: uint256, _N: uint256, _user: address
+) -> uint256:
+    """
+    @notice Calculation of maximum which can be borrowed now.
+            Same as max_borrowable, also bounded by the recent debt limit.
+    @param _d_collateral Collateral amount against which to borrow
+                         (additional amount if the user has a position)
+    @param _N Number of bands to have the deposit into (to be ignored if the user has a position)
+    @param _user User to calculate the value for
+                 (can be zero address for create_loan if the user doesn't have extra_health)
+    @return Maximum (additional) amount of borrowed asset to borrow
+    """
+    return staticcall ILendView(core._view.address).max_borrowable_now(
+        _d_collateral, _N, _user, self._recent_debt_packed
+    )
+
+
+@external
+@view
+def lent() -> uint256:
+    """
+    @notice Total amount of borrowed tokens lent out since creation
+    @return Total lent amount
+    """
+    return core.lent
+
+
+@external
+@view
+def repaid() -> uint256:
+    """
+    @notice Total amount of borrowed tokens repaid since creation
+    @return Total repaid amount
+    """
+    return core.repaid
+
+
+@external
+@view
+def collected() -> uint256:
+    """
+    @notice Cumulative amount of borrowed assets ever collected as admin fees
+    @return Total collected admin fees
+    """
+    return core.collected

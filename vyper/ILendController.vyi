@@ -1,0 +1,57 @@
+# Llamalend-specific interface additions not covered by IController
+
+@external
+@view
+def vault() -> address:
+    ...
+
+
+@external
+def configure_lend(_borrow_cap: uint256, _admin_percentage: uint256):
+    ...
+
+
+@external
+def on_borrowed_token_transfer_in(_amount: uint256):
+    ...
+
+
+@external
+def on_borrowed_token_transfer_out(_amount: uint256):
+    ...
+
+
+@external
+@view
+def borrow_cap() -> uint256:
+    ...
+
+
+@external
+@view
+def max_borrowable_now(_d_collateral: uint256, _N: uint256, _user: address) -> uint256:
+    ...
+
+
+@external
+@view
+def lent() -> uint256:
+    ...
+
+
+@external
+@view
+def repaid() -> uint256:
+    ...
+
+
+@external
+@view
+def collected() -> uint256:
+    ...
+
+
+@external
+@view
+def admin_percentage() -> uint256:
+    ...
